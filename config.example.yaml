@@ -1,0 +1,18 @@
+slack:
+  channel: "C0123456789"  # Channel ID (preferred) or "#channel-name"
+
+repositories:
+  - owner/repo-a
+  - owner/repo-b
+
+reminders:
+  ignore_drafts: true
+  ping_author_if_no_reviewer: true
+  parse_body_mentions: true
+  stale_hours: 0  # 0 = no filter; >0 = only PRs open longer than N hours
+
+users:
+  - github: alice
+    slack_username: alice.smith  # Slack username (Settings -> Profile -> username), resolved to a member ID at runtime
+  - github: bob
+    slack_username: bob.jones

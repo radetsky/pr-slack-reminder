@@ -1,0 +1,31 @@
+name: PR review reminder
+
+on:
+  schedule:
+    - cron: "0 9 * * 1-5"   # ~09:00 UTC on weekdays
+    - cron: "0 14 * * 1-5"  # ~14:00 UTC on weekdays
+  workflow_dispatch: {}      # allows manual trigger via GitHub UI for testing
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pr-bot
+        run: pip install -e .
+
+      - name: Write config.yaml from secret
+        run: printf '%s\n' "$CONFIG_YAML" > config.yaml
+        env:
+          CONFIG_YAML: ${{ secrets.CONFIG_YAML }}
+
+      - name: Run reminder
+        run: python -m pr_bot --config config.yaml
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

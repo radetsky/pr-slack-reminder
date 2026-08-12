@@ -108,12 +108,32 @@ def _pr_line(pr: PullRequest, now: datetime) -> str:
     return f"• :{emoji}: {link} _({int(age_days)} days)_"
 
 
+def _pr_counts(targets: list[ReminderTarget]) -> tuple[int, int]:
+    """Return the total PR mentions across *targets* and the count of distinct PRs.
+
+    A PR requested from two reviewers counts twice toward the total but once
+    toward the unique count.
+
+    Args:
+        targets: Reminder targets to count PRs across.
+
+    Returns:
+        Tuple of (total mentions, distinct PR count).
+    """
+    total = sum(len(target.pull_requests) for target in targets)
+    unique = {(pr.repo, pr.number) for target in targets for pr in target.pull_requests}
+    return total, len(unique)
+
+
 def build_blocks(targets: list[ReminderTarget]) -> list[dict]:
     """Build Slack Block Kit blocks for the PR review digest message.
 
     Sections are ordered by descending PR count, so the users with the most
-    pending reviews appear first. Each PR line is prefixed with an age-tier
-    emoji (green/yellow/orange/red/skull) and its age in days.
+    pending reviews appear first. Within each section, PRs are ordered by
+    descending age across all repositories. Each PR line is prefixed with an
+    age-tier emoji (green/yellow/orange/red/skull) and its age in days. The
+    header reports the total number of PR mentions, plus the number of
+    distinct PRs when that differs from the total.
 
     Args:
         targets: Non-empty list of ReminderTarget instances.
@@ -124,19 +144,28 @@ def build_blocks(targets: list[ReminderTarget]) -> list[dict]:
     sorted_targets = sorted(targets, key=lambda t: len(t.pull_requests), reverse=True)
     now = now_utc()
 
+    total, unique = _pr_counts(sorted_targets)
+    count_line = f"*{total} PR{'s' if total != 1 else ''}* to review"
+    if unique != total:
+        count_line += f" ({unique} unique)"
+
     blocks: list[dict] = [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": ":wave: *PR review reminder* — when you get a moment, these pull requests could use your review. Thanks for helping keep things moving!",
+                "text": (
+                    ":wave: *PR review reminder* — when you get a moment, these pull requests "
+                    f"could use your review. Thanks for helping keep things moving!\n{count_line}"
+                ),
             },
         },
         {"type": "divider"},
     ]
 
     for target in sorted_targets:
-        pr_lines = [_pr_line(pr, now) for pr in target.pull_requests]
+        prs_by_age = sorted(target.pull_requests, key=lambda pr: pr.age_hours(now), reverse=True)
+        pr_lines = [_pr_line(pr, now) for pr in prs_by_age]
         prs_text = "\n".join(pr_lines)
         blocks.append(
             {

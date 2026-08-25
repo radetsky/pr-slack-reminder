@@ -102,3 +102,15 @@ def test_build_blocks_header_omits_unique_count_when_no_duplicates():
     header_text = build_blocks(targets)[0]["text"]["text"]
     assert "*2 PRs* to review" in header_text
     assert "unique" not in header_text
+
+
+def test_build_blocks_splits_target_with_many_prs_across_sections():
+    """A target with enough PRs to exceed Slack's 3000-char section limit spills into more sections."""
+    many_prs = [_make_pr(n) for n in range(40)]
+    targets = [ReminderTarget(slack_id="U111", display="alice", pull_requests=many_prs)]
+    blocks = build_blocks(targets)
+    section_texts = [b["text"]["text"] for b in blocks if b["type"] == "section"]
+    target_sections = section_texts[1:-1]
+    assert len(target_sections) > 1
+    assert all(len(text) <= 3000 for text in target_sections)
+    assert sum(text.count("\n") + 1 for text in target_sections) == len(many_prs) + 1

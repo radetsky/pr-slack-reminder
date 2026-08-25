@@ -13,6 +13,9 @@ from pr_bot.models import PullRequest, ReminderTarget
 
 logger = logging.getLogger(__name__)
 
+# Slack section blocks reject text over 3000 characters (invalid_blocks).
+_SECTION_TEXT_LIMIT = 3000
+
 # (minimum age in days, emoji) pairs, checked from oldest to youngest.
 _AGE_TIERS: list[tuple[int, str]] = [
     (60, "skull"),
@@ -125,6 +128,67 @@ def _pr_counts(targets: list[ReminderTarget]) -> tuple[int, int]:
     return total, len(unique)
 
 
+def _chunk_lines(lines: list[str], first_budget: int, rest_budget: int) -> list[list[str]]:
+    """Group *lines* into chunks that each fit within a character budget.
+
+    The first chunk uses *first_budget* (typically smaller, to leave room for
+    a prefix like a mention); every later chunk uses *rest_budget*.
+
+    Args:
+        lines: Lines to group, each without a trailing newline.
+        first_budget: Max combined length (including joining newlines) for the first chunk.
+        rest_budget: Max combined length for every subsequent chunk.
+
+    Returns:
+        List of line-group chunks, each non-empty, in original order.
+    """
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+    budget = first_budget
+    for line in lines:
+        added_len = len(line) if not current else len(line) + 1
+        if current and current_len + added_len > budget:
+            chunks.append(current)
+            current = []
+            current_len = 0
+            budget = rest_budget
+            added_len = len(line)
+        current.append(line)
+        current_len += added_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _target_section_blocks(target: ReminderTarget, now: datetime) -> list[dict]:
+    """Build one or more Slack section blocks for a single target's PRs.
+
+    Splits the PR list across multiple sections when a single section's text
+    would exceed Slack's 3000-character limit for section text, rather than
+    letting `chat.postMessage` reject the whole message with `invalid_blocks`.
+
+    Args:
+        target: Reminder target to render.
+        now: Current time, used to compute PR age and sort order.
+
+    Returns:
+        List of section block dicts covering all of the target's PRs.
+    """
+    mention = _mention(target)
+    prs_by_age = sorted(target.pull_requests, key=lambda pr: pr.age_hours(now), reverse=True)
+    pr_lines = [_pr_line(pr, now) for pr in prs_by_age]
+
+    first_budget = _SECTION_TEXT_LIMIT - len(mention) - 1
+    chunks = _chunk_lines(pr_lines, first_budget=first_budget, rest_budget=_SECTION_TEXT_LIMIT)
+
+    blocks = []
+    for i, chunk in enumerate(chunks):
+        text = "\n".join(chunk) if i > 0 else f"{mention}\n" + "\n".join(chunk)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    return blocks
+
+
 def build_blocks(targets: list[ReminderTarget]) -> list[dict]:
     """Build Slack Block Kit blocks for the PR review digest message.
 
@@ -133,7 +197,9 @@ def build_blocks(targets: list[ReminderTarget]) -> list[dict]:
     descending age across all repositories. Each PR line is prefixed with an
     age-tier emoji (green/yellow/orange/red/skull) and its age in days. The
     header reports the total number of PR mentions, plus the number of
-    distinct PRs when that differs from the total.
+    distinct PRs when that differs from the total. A target with enough PRs
+    to exceed Slack's 3000-character section text limit spills into
+    additional section blocks rather than being rejected by the API.
 
     Args:
         targets: Non-empty list of ReminderTarget instances.
@@ -164,18 +230,7 @@ def build_blocks(targets: list[ReminderTarget]) -> list[dict]:
     ]
 
     for target in sorted_targets:
-        prs_by_age = sorted(target.pull_requests, key=lambda pr: pr.age_hours(now), reverse=True)
-        pr_lines = [_pr_line(pr, now) for pr in prs_by_age]
-        prs_text = "\n".join(pr_lines)
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"{_mention(target)}\n{prs_text}",
-                },
-            }
-        )
+        blocks.extend(_target_section_blocks(target, now))
 
     blocks.append({"type": "divider"})
     blocks.append(

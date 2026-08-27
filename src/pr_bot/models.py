@@ -2,6 +2,15 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
+
+
+class ReviewStatus(Enum):
+    """A pull request's aggregate review state, derived from its reviews."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    NEEDS_WORK = "needs_work"
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,7 @@ class PullRequest:
     body: str
     draft: bool
     created_at: datetime
+    review_status: ReviewStatus = ReviewStatus.PENDING
 
     def age_hours(self, now: datetime) -> float:
         """Return PR age in hours relative to *now*."""

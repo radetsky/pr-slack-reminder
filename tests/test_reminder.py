@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
-from pr_bot.models import AppConfig, PullRequest, RemindersConfig, UserMapping
-from pr_bot.reminder import _collect_targets_for_pr, build_reminder_targets
+from pr_bot.models import AppConfig, PullRequest, RemindersConfig, ReviewStatus, UserMapping
+from pr_bot.reminder import ReviewSignal, _collect_targets_for_pr, build_reminder_targets
 
 USERS = [
     UserMapping(github="alice", slack_username="alice.smith"),
@@ -100,20 +100,17 @@ def test_collect_targets_deduplicates():
 def test_collect_targets_excludes_reviewer_who_reviewed_since_push():
     """A reviewer who already reviewed after the latest commit is not re-pinged."""
     pr = _make_pr(reviewer_logins=["bob"])
-    targets = _collect_targets_for_pr(
-        pr, _make_cfg(), _lookup(), reviewed_since_push=frozenset({"bob"})
-    )
+    signal = ReviewSignal(satisfied=frozenset({"bob"}), status=ReviewStatus.PENDING, reopened=frozenset())
+    targets = _collect_targets_for_pr(pr, _make_cfg(), _lookup(), signal)
     assert targets == []
 
 
 def test_collect_targets_excludes_body_mention_reviewed_since_push():
     """A body-mentioned user who already commented since the last push is skipped."""
     pr = _make_pr(reviewer_logins=[], body="cc @bob")
+    signal = ReviewSignal(satisfied=frozenset({"bob"}), status=ReviewStatus.PENDING, reopened=frozenset())
     targets = _collect_targets_for_pr(
-        pr,
-        _make_cfg(ping_author_if_no_reviewer=False),
-        _lookup(),
-        reviewed_since_push=frozenset({"bob"}),
+        pr, _make_cfg(ping_author_if_no_reviewer=False), _lookup(), signal
     )
     assert targets == []
 
@@ -121,13 +118,28 @@ def test_collect_targets_excludes_body_mention_reviewed_since_push():
 def test_collect_targets_author_fallback_ignores_reviewed_since_push():
     """The ping_author_if_no_reviewer fallback is unaffected by reviewed_since_push."""
     pr = _make_pr(reviewer_logins=[], author_login="alice")
+    signal = ReviewSignal(satisfied=frozenset({"alice"}), status=ReviewStatus.PENDING, reopened=frozenset())
     targets = _collect_targets_for_pr(
-        pr,
-        _make_cfg(ping_author_if_no_reviewer=True),
-        _lookup(),
-        reviewed_since_push=frozenset({"alice"}),
+        pr, _make_cfg(ping_author_if_no_reviewer=True), _lookup(), signal
     )
     assert any(t.slack_id == "U111" for t in targets)
+
+
+def test_collect_targets_standing_approval_skips_unresponsive_reviewer():
+    """Once the PR has a standing approval, an unresponsive requested reviewer is not pinged."""
+    pr = _make_pr(reviewer_logins=["bob"], author_login="alice")
+    signal = ReviewSignal(satisfied=frozenset(), status=ReviewStatus.APPROVED, reopened=frozenset())
+    targets = _collect_targets_for_pr(pr, _make_cfg(), _lookup(), signal)
+    assert len(targets) == 1
+    assert targets[0].slack_id == "U111"
+
+
+def test_collect_targets_standing_approval_still_pings_reopened_login():
+    """A login reopened by an explicit @-mention is pinged despite the standing approval."""
+    pr = _make_pr(reviewer_logins=["bob"], author_login="alice")
+    signal = ReviewSignal(satisfied=frozenset(), status=ReviewStatus.APPROVED, reopened=frozenset({"bob"}))
+    targets = _collect_targets_for_pr(pr, _make_cfg(), _lookup(), signal)
+    assert {t.slack_id for t in targets} == {"U111", "U222"}
 
 
 def test_pr_age_hours():
@@ -168,6 +180,7 @@ def test_build_reminder_targets_includes_non_draft(httpx_mock):
     httpx_mock.add_response(json=[_pr_api_payload(draft=False)])
     httpx_mock.add_response(json=[])  # reviews
     httpx_mock.add_response(json=[])  # commits
+    httpx_mock.add_response(json=[])  # issue comments
 
     with patch("pr_bot.reminder.now_utc", return_value=NOW):
         targets = build_reminder_targets(_make_cfg(), USERNAME_TO_ID)
@@ -183,11 +196,112 @@ def test_build_reminder_targets_excludes_reviewer_who_already_reviewed(httpx_moc
         json=[{"user": {"login": "bob"}, "submitted_at": "2024-01-19T00:00:00Z"}]
     )
     httpx_mock.add_response(json=[{"commit": {"committer": {"date": "2024-01-18T10:00:00Z"}}}])
+    httpx_mock.add_response(json=[])  # issue comments
 
     with patch("pr_bot.reminder.now_utc", return_value=NOW):
         targets = build_reminder_targets(_make_cfg(ping_author_if_no_reviewer=False), USERNAME_TO_ID)
 
     assert targets == []
+
+
+def test_build_reminder_targets_excludes_body_mention_who_commented(httpx_mock):
+    """A body-mentioned user who only left a plain PR comment is not re-pinged."""
+    payload = {**_pr_api_payload(draft=False), "requested_reviewers": [], "body": "cc @bob"}
+    httpx_mock.add_response(json=[payload])
+    httpx_mock.add_response(json=[])  # reviews
+    httpx_mock.add_response(json=[{"commit": {"committer": {"date": "2024-01-18T10:00:00Z"}}}])
+    httpx_mock.add_response(
+        json=[{"user": {"login": "bob"}, "created_at": "2024-01-19T00:00:00Z"}]
+    )
+
+    with patch("pr_bot.reminder.now_utc", return_value=NOW):
+        targets = build_reminder_targets(_make_cfg(ping_author_if_no_reviewer=False), USERNAME_TO_ID)
+
+    assert targets == []
+
+
+def test_build_reminder_targets_marks_approved_pr(httpx_mock):
+    """A PR with an APPROVED review carries ReviewStatus.APPROVED."""
+    payload = {**_pr_api_payload(draft=False), "requested_reviewers": []}
+    httpx_mock.add_response(json=[payload])
+    httpx_mock.add_response(
+        json=[{"user": {"login": "bob"}, "submitted_at": "2024-01-19T00:00:00Z", "state": "APPROVED"}]
+    )
+    httpx_mock.add_response(json=[{"commit": {"committer": {"date": "2024-01-18T10:00:00Z"}}}])
+    httpx_mock.add_response(json=[])  # issue comments
+
+    with patch("pr_bot.reminder.now_utc", return_value=NOW):
+        targets = build_reminder_targets(_make_cfg(ping_author_if_no_reviewer=True), USERNAME_TO_ID)
+
+    assert len(targets) == 1
+    assert targets[0].pull_requests[0].review_status == ReviewStatus.APPROVED
+
+
+def test_build_reminder_targets_approval_survives_new_commit(httpx_mock):
+    """A standing approval means only the author is pinged, even with a pending reviewer."""
+    payload = {**_pr_api_payload(draft=False, reviewers=["bob"]), "body": "cc @carol"}
+    httpx_mock.add_response(json=[payload])
+    httpx_mock.add_response(
+        json=[{"user": {"login": "carol"}, "submitted_at": "2024-01-19T00:00:00Z", "state": "APPROVED"}]
+    )
+    httpx_mock.add_response(
+        json=[
+            {"commit": {"committer": {"date": "2024-01-18T10:00:00Z"}}},
+            {"commit": {"committer": {"date": "2024-01-20T00:00:00Z"}}},
+        ]
+    )
+    httpx_mock.add_response(json=[])  # issue comments
+
+    with patch("pr_bot.reminder.now_utc", return_value=NOW):
+        targets = build_reminder_targets(_make_cfg(), USERNAME_TO_ID)
+
+    # carol (body-mentioned) approved: the PR is treated as reviewed, so neither she
+    # nor bob (the still-unresponsive requested reviewer) is pinged -- only the author.
+    assert len(targets) == 1
+    assert targets[0].slack_id == "U111"
+    assert targets[0].pull_requests[0].review_status == ReviewStatus.APPROVED
+
+
+def test_build_reminder_targets_remention_after_approval_repings(httpx_mock):
+    """An explicit @-mention after someone's approval reopens their ping."""
+    payload = {**_pr_api_payload(draft=False), "requested_reviewers": [], "body": "cc @carol"}
+    httpx_mock.add_response(json=[payload])
+    httpx_mock.add_response(
+        json=[{"user": {"login": "carol"}, "submitted_at": "2024-01-19T00:00:00Z", "state": "APPROVED"}]
+    )
+    httpx_mock.add_response(json=[{"commit": {"committer": {"date": "2024-01-18T10:00:00Z"}}}])
+    httpx_mock.add_response(
+        json=[
+            {
+                "user": {"login": "alice"},
+                "created_at": "2024-01-19T12:00:00Z",
+                "body": "@carol can you take another look?",
+            }
+        ]
+    )
+
+    with patch("pr_bot.reminder.now_utc", return_value=NOW):
+        targets = build_reminder_targets(_make_cfg(ping_author_if_no_reviewer=False), USERNAME_TO_ID)
+
+    assert len(targets) == 1
+    assert targets[0].display == "carol"
+
+
+def test_build_reminder_targets_marks_needs_work_pr(httpx_mock):
+    """A PR with no pending reviewers and no approval carries ReviewStatus.NEEDS_WORK."""
+    payload = {**_pr_api_payload(draft=False), "requested_reviewers": []}
+    httpx_mock.add_response(json=[payload])
+    httpx_mock.add_response(
+        json=[{"user": {"login": "bob"}, "submitted_at": "2024-01-19T00:00:00Z", "state": "CHANGES_REQUESTED"}]
+    )
+    httpx_mock.add_response(json=[{"commit": {"committer": {"date": "2024-01-18T10:00:00Z"}}}])
+    httpx_mock.add_response(json=[])  # issue comments
+
+    with patch("pr_bot.reminder.now_utc", return_value=NOW):
+        targets = build_reminder_targets(_make_cfg(ping_author_if_no_reviewer=True), USERNAME_TO_ID)
+
+    assert len(targets) == 1
+    assert targets[0].pull_requests[0].review_status == ReviewStatus.NEEDS_WORK
 
 
 def test_build_reminder_targets_stale_filter(httpx_mock):

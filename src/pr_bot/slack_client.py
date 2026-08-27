@@ -9,7 +9,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from pr_bot.github_client import now_utc
-from pr_bot.models import PullRequest, ReminderTarget
+from pr_bot.models import PullRequest, ReminderTarget, ReviewStatus
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,12 @@ _AGE_TIERS: list[tuple[int, str]] = [
     (7, "large_yellow_circle"),
     (0, "large_green_circle"),
 ]
+
+# Review-status emoji, shown before the age-tier emoji. PENDING carries none.
+_STATUS_EMOJI: dict[ReviewStatus, str] = {
+    ReviewStatus.APPROVED: "white_check_mark",
+    ReviewStatus.NEEDS_WORK: "pencil2",
+}
 
 
 def fetch_workspace_usernames(token: str) -> dict[str, str]:
@@ -96,7 +102,7 @@ def _age_emoji(age_days: float) -> str:
 
 
 def _pr_line(pr: PullRequest, now: datetime) -> str:
-    """Return the mrkdwn bullet line for *pr*, prefixed with an age-tier emoji.
+    """Return the mrkdwn bullet line for *pr*, prefixed with status and age emoji.
 
     Args:
         pr: The pull request to render.
@@ -107,8 +113,10 @@ def _pr_line(pr: PullRequest, now: datetime) -> str:
     """
     age_days = pr.age_hours(now) / 24
     emoji = _age_emoji(age_days)
+    status_emoji = _STATUS_EMOJI.get(pr.review_status)
+    status_part = f":{status_emoji}: " if status_emoji else ""
     link = f"<{pr.url}|{pr.repo}#{pr.number}: {pr.title}>"
-    return f"• :{emoji}: {link} _({int(age_days)} days)_"
+    return f"• {status_part}:{emoji}: {link} _({int(age_days)} days)_"
 
 
 def _pr_counts(targets: list[ReminderTarget]) -> tuple[int, int]:
@@ -195,7 +203,8 @@ def build_blocks(targets: list[ReminderTarget]) -> list[dict]:
     Sections are ordered by descending PR count, so the users with the most
     pending reviews appear first. Within each section, PRs are ordered by
     descending age across all repositories. Each PR line is prefixed with an
-    age-tier emoji (green/yellow/orange/red/skull) and its age in days. The
+    age-tier emoji (green/yellow/orange/red/skull) and its age in days, plus a
+    leading review-status emoji when the PR is approved or needs changes. The
     header reports the total number of PR mentions, plus the number of
     distinct PRs when that differs from the total. A target with enough PRs
     to exceed Slack's 3000-character section text limit spills into

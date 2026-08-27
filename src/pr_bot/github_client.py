@@ -129,6 +129,49 @@ def fetch_pr_commits(repo: str, number: int, client: httpx.Client) -> list[dict]
     return _fetch_paginated(url, client)
 
 
+def fetch_pr_issue_comments(repo: str, number: int, client: httpx.Client) -> list[dict]:
+    """Fetch all Conversation-tab comments left on a pull request.
+
+    Pull requests are issues in GitHub's API model, so plain comments left on
+    the Conversation tab (as opposed to inline review comments) live under the
+    issue comments endpoint, not a pulls-specific one.
+
+    Args:
+        repo: Repository in 'owner/name' format.
+        number: Pull request number.
+        client: Authenticated httpx.Client instance.
+
+    Returns:
+        Raw issue comment objects as returned by the GitHub REST API.
+
+    Raises:
+        httpx.HTTPStatusError: On non-2xx GitHub responses (propagated to caller).
+    """
+    url = f"{_GITHUB_API_BASE}/repos/{repo}/issues/{number}/comments"
+    return _fetch_paginated(url, client)
+
+
+def latest_comment_per_login(comments: list[dict]) -> dict[str, datetime]:
+    """Return each commenter's most recent Conversation-tab comment time.
+
+    Args:
+        comments: Raw issue comment objects from :func:`fetch_pr_issue_comments`.
+
+    Returns:
+        Lowercase GitHub login -> timestamp of that user's latest comment.
+    """
+    latest: dict[str, datetime] = {}
+    for comment in comments:
+        created_raw = comment.get("created_at")
+        if not created_raw:
+            continue
+        login = comment["user"]["login"].lower()
+        created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        if login not in latest or created_at > latest[login]:
+            latest[login] = created_at
+    return latest
+
+
 def latest_review_per_login(reviews: list[dict]) -> dict[str, datetime]:
     """Return each reviewer's most recent review submission time.
 
@@ -147,6 +190,37 @@ def latest_review_per_login(reviews: list[dict]) -> dict[str, datetime]:
         submitted_at = datetime.fromisoformat(submitted_raw.replace("Z", "+00:00"))
         if login not in latest or submitted_at > latest[login]:
             latest[login] = submitted_at
+    return latest
+
+
+_DECISIVE_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
+
+
+def latest_decisive_review_per_login(reviews: list[dict]) -> dict[str, tuple[str, datetime]]:
+    """Return each reviewer's most recent decisive review state and its timestamp.
+
+    Comments (state COMMENTED) are ignored, so a reviewer who approves and
+    later leaves a comment still counts as having approved. The timestamp is
+    returned alongside the state so callers can tell a fresh decision from one
+    that predates a later commit.
+
+    Args:
+        reviews: Raw review objects from :func:`fetch_pr_reviews`.
+
+    Returns:
+        Lowercase GitHub login -> (latest decisive state, its timestamp).
+        State is one of APPROVED, CHANGES_REQUESTED, or DISMISSED.
+    """
+    latest: dict[str, tuple[str, datetime]] = {}
+    for review in reviews:
+        state = review.get("state")
+        submitted_raw = review.get("submitted_at")
+        if state not in _DECISIVE_STATES or not submitted_raw:
+            continue
+        login = review["user"]["login"].lower()
+        submitted_at = datetime.fromisoformat(submitted_raw.replace("Z", "+00:00"))
+        if login not in latest or submitted_at >= latest[login][1]:
+            latest[login] = (state, submitted_at)
     return latest
 
 

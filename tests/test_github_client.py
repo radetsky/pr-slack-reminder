@@ -9,8 +9,11 @@ from pr_bot.github_client import (
     _next_page_url,
     fetch_open_prs,
     fetch_pr_commits,
+    fetch_pr_issue_comments,
     fetch_pr_reviews,
+    latest_comment_per_login,
     latest_commit_at,
+    latest_decisive_review_per_login,
     latest_review_per_login,
     make_client,
     parse_body_mentions,
@@ -138,6 +141,56 @@ def test_latest_review_per_login_ignores_pending_requests():
     """Reviews without submitted_at (e.g. pending) are skipped."""
     reviews = [{"user": {"login": "bob"}, "submitted_at": None}]
     assert latest_review_per_login(reviews) == {}
+
+
+def test_fetch_pr_issue_comments(httpx_mock):
+    """Fetches raw Conversation-tab comment objects for a pull request."""
+    httpx_mock.add_response(
+        json=[{"user": {"login": "bob"}, "created_at": "2024-01-19T00:00:00Z"}]
+    )
+
+    with make_client("token") as client:
+        comments = fetch_pr_issue_comments("owner/repo", 1, client)
+
+    assert len(comments) == 1
+    assert comments[0]["user"]["login"] == "bob"
+
+
+def test_latest_comment_per_login_keeps_most_recent():
+    """Multiple comments from the same user collapse to the latest timestamp."""
+    comments = [
+        {"user": {"login": "Bob"}, "created_at": "2024-01-18T00:00:00Z"},
+        {"user": {"login": "bob"}, "created_at": "2024-01-19T00:00:00Z"},
+    ]
+    latest = latest_comment_per_login(comments)
+    assert latest["bob"] == datetime(2024, 1, 19, 0, 0, tzinfo=timezone.utc)
+
+
+def test_latest_comment_per_login_empty_input():
+    """No comments yields an empty mapping."""
+    assert latest_comment_per_login([]) == {}
+
+
+def test_latest_decisive_review_per_login_ignores_comments():
+    """A COMMENTED-only review does not count as a decisive state."""
+    reviews = [{"user": {"login": "bob"}, "submitted_at": "2024-01-19T00:00:00Z", "state": "COMMENTED"}]
+    assert latest_decisive_review_per_login(reviews) == {}
+
+
+def test_latest_decisive_review_per_login_keeps_latest_state():
+    """A later APPROVED review overrides an earlier CHANGES_REQUESTED one."""
+    reviews = [
+        {"user": {"login": "bob"}, "submitted_at": "2024-01-18T00:00:00Z", "state": "CHANGES_REQUESTED"},
+        {"user": {"login": "bob"}, "submitted_at": "2024-01-19T00:00:00Z", "state": "APPROVED"},
+    ]
+    assert latest_decisive_review_per_login(reviews) == {
+        "bob": ("APPROVED", datetime(2024, 1, 19, 0, 0, tzinfo=timezone.utc))
+    }
+
+
+def test_latest_decisive_review_per_login_empty_input():
+    """No reviews yields an empty mapping."""
+    assert latest_decisive_review_per_login([]) == {}
 
 
 def test_latest_commit_at_returns_max():

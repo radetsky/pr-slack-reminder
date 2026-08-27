@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 from slack_sdk.errors import SlackApiError
 
-from pr_bot.models import PullRequest, ReminderTarget
+from pr_bot.models import PullRequest, ReminderTarget, ReviewStatus
 from pr_bot.slack_client import build_blocks, fetch_workspace_usernames
 
 NOW = datetime(2024, 1, 20, 12, 0, 0, tzinfo=timezone.utc)
@@ -16,7 +16,9 @@ def _member(name: str, user_id: str, *, deleted: bool = False, is_bot: bool = Fa
     return {"id": user_id, "name": name, "deleted": deleted, "is_bot": is_bot}
 
 
-def _make_pr(number: int, repo: str = "owner/repo") -> PullRequest:
+def _make_pr(
+    number: int, repo: str = "owner/repo", status: ReviewStatus = ReviewStatus.PENDING
+) -> PullRequest:
     """Build a PullRequest with sensible defaults, identified by *number* and *repo*."""
     return PullRequest(
         number=number,
@@ -28,6 +30,7 @@ def _make_pr(number: int, repo: str = "owner/repo") -> PullRequest:
         body="",
         draft=False,
         created_at=NOW,
+        review_status=status,
     )
 
 
@@ -102,6 +105,45 @@ def test_build_blocks_header_omits_unique_count_when_no_duplicates():
     header_text = build_blocks(targets)[0]["text"]["text"]
     assert "*2 PRs* to review" in header_text
     assert "unique" not in header_text
+
+
+def test_build_blocks_shows_approved_status_emoji():
+    """An approved PR's line is prefixed with the white_check_mark emoji."""
+    targets = [
+        ReminderTarget(
+            slack_id="U111",
+            display="alice",
+            pull_requests=[_make_pr(1, status=ReviewStatus.APPROVED)],
+        )
+    ]
+    with patch("pr_bot.slack_client.now_utc", return_value=NOW):
+        blocks = build_blocks(targets)
+    section_text = blocks[2]["text"]["text"]
+    assert ":white_check_mark: :large_green_circle:" in section_text
+
+
+def test_build_blocks_shows_needs_work_status_emoji():
+    """A needs-work PR's line is prefixed with the pencil2 emoji."""
+    targets = [
+        ReminderTarget(
+            slack_id="U111",
+            display="alice",
+            pull_requests=[_make_pr(1, status=ReviewStatus.NEEDS_WORK)],
+        )
+    ]
+    with patch("pr_bot.slack_client.now_utc", return_value=NOW):
+        blocks = build_blocks(targets)
+    section_text = blocks[2]["text"]["text"]
+    assert ":pencil2: :large_green_circle:" in section_text
+
+
+def test_build_blocks_omits_status_emoji_for_pending():
+    """A pending PR's line has no status emoji prefix, just the age emoji."""
+    targets = [ReminderTarget(slack_id="U111", display="alice", pull_requests=[_make_pr(1)])]
+    with patch("pr_bot.slack_client.now_utc", return_value=NOW):
+        blocks = build_blocks(targets)
+    section_text = blocks[2]["text"]["text"]
+    assert "• :large_green_circle:" in section_text
 
 
 def test_build_blocks_splits_target_with_many_prs_across_sections():
